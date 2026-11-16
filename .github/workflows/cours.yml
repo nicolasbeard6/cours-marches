@@ -1,0 +1,30 @@
+name: Relevé des cours
+on:
+  schedule:
+    - cron: "7,37 * * * *"      # toutes les 30 minutes (GitHub peut retarder de quelques minutes)
+  workflow_dispatch:
+  push:
+    branches: [main]
+permissions:
+  contents: write
+concurrency:
+  group: cours
+  cancel-in-progress: false
+jobs:
+  releve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Relever les cours
+        run: python fetch.py out
+      - name: Publier dans la branche data (un seul commit, remplacé à chaque relevé)
+        run: |
+          cd out
+          git init -q -b data
+          git add -A
+          git -c user.name="releve-cours" -c user.email="releve-cours@users.noreply.github.com" commit -qm "Cours du $(date -u +'%Y-%m-%d %H:%M') UTC"
+          git push -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" data
