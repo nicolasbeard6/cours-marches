@@ -19,6 +19,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Installer yfinance
+        run: pip install -q yfinance
       - name: Relever les cours
         run: python fetch.py out
       - name: Publier dans la branche data (un seul commit, remplacé à chaque relevé)

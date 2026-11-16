@@ -2,9 +2,8 @@
 plus les 50 premières cryptos par capitalisation (classement CoinGecko), et écrit :
   out/resume.json            un résumé chiffré par instrument
   out/barres/<fichier>.json  les barres [t, ouverture, haut, bas, clôture] de chaque instrument
-Bibliothèque standard uniquement. Usage : python fetch.py [dossier_de_sortie]
+Dépendance : yfinance. Usage : python fetch.py [dossier_de_sortie]
 """
-import concurrent.futures as cf
 import json
 import os
 import re
@@ -34,14 +33,34 @@ def get(url, timeout=20, tries=3):
     raise err
 
 
-def chart(sym):
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{urllib.parse.quote(sym)}?range=1mo&interval=60m"
-    r = get(url)["chart"]["result"][0]
-    q = r["indicators"]["quote"][0]
-    bars = [[t, o, h, l, c] for t, o, h, l, c in zip(r.get("timestamp") or [], q["open"], q["high"], q["low"], q["close"])
-            if None not in (o, h, l, c)]
-    return {"cours": r["meta"].get("regularMarketPrice"), "heure": r["meta"].get("regularMarketTime"),
-            "devise": r["meta"].get("currency"), "bars": bars}
+def load(symbols, lot=40):
+    """Barres d'une heure sur un mois pour une liste de symboles Yahoo, via la bibliothèque yfinance
+    (Yahoo refuse les requêtes directes venant des machines de GitHub). Renvoie {symbole: données}."""
+    import yfinance as yf
+    out = {}
+    for i in range(0, len(symbols), lot):
+        part = symbols[i:i + lot]
+        try:
+            df = yf.download(part, period="1mo", interval="60m", group_by="ticker", auto_adjust=False,
+                             progress=False, threads=True)
+        except Exception as e:
+            print("lot en échec :", str(e)[:120])
+            continue
+        for s in part:
+            try:
+                sub = df[s][["Open", "High", "Low", "Close"]].dropna()
+            except Exception:
+                continue
+            if sub.empty:
+                continue
+            bars = [[int(t.timestamp()), float(o), float(h), float(l), float(c)]
+                    for t, (o, h, l, c) in zip(sub.index, sub.to_numpy())]
+            out[s] = {"cours": bars[-1][4], "heure": bars[-1][0], "devise": None, "bars": bars}
+        if i == 0 and not out:
+            print("Premier lot entièrement vide : Yahoo refuse probablement les requêtes, on arrête.")
+            break
+        time.sleep(1)
+    return out
 
 
 def sig(x, n=7):
@@ -90,61 +109,40 @@ def top_crypto(n=50):
     return out
 
 
-def yahoo_crypto(ticker, ref):
-    """Trouve le symbole Yahoo d'une crypto dont le cours est proche de ref (classement). Renvoie (symbole, données) ou None."""
-    cands = [f"{ticker}-USD"]
-    try:
-        s = get(f"https://query1.finance.yahoo.com/v1/finance/search?q={urllib.parse.quote(ticker + '-USD')}&quotesCount=8&newsCount=0", tries=1)
-        cands += [q["symbol"] for q in s.get("quotes", []) if q.get("quoteType") == "CRYPTOCURRENCY"
-                  and q["symbol"].startswith(ticker) and q["symbol"].endswith("-USD") and q["symbol"] not in cands]
-    except Exception:
-        pass
-    for c in cands[:4]:
-        try:
-            d = chart(c)
-        except Exception:
-            continue
-        if d["cours"] and ref and abs(d["cours"] / ref - 1) < 0.03:
-            return c, d
-    return None
-
-
 def main(outdir):
     uni = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "univers.json"), encoding="utf-8"))
-    jobs, secours = [], []
+    classe_de, noms, secours, ref = {}, {}, [], {}
     for classe, syms in uni.items():
         if classe.startswith("Crypto"):
             secours = syms
         else:
-            jobs += [(classe, s, None) for s in syms]
+            classe_de.update({s: classe for s in syms})
+    try:
+        for name, t, px in top_crypto():
+            classe_de[f"{t}-USD"], noms[f"{t}-USD"], ref[f"{t}-USD"] = "Crypto", name, px
+        source_crypto = "classement CoinGecko"
+    except Exception as e:
+        print("CoinGecko indisponible :", e)
+        source_crypto = "liste de secours"
+        classe_de.update({s: "Crypto" for s in secours})
+    brut = load(list(classe_de))
     instruments, erreurs, data = [], [], {}
-    with cf.ThreadPoolExecutor(6) as ex:
-        futs = {ex.submit(chart, s): (c, s, n) for c, s, n in jobs}
-        try:
-            top = top_crypto()
-            source_crypto = "classement CoinGecko"
-            cfuts = {ex.submit(yahoo_crypto, t, px): (name, t) for name, t, px in top}
-        except Exception as e:
-            print("CoinGecko indisponible :", e)
-            source_crypto, cfuts = "liste de secours", {}
-            futs.update({ex.submit(chart, s): ("Crypto", s, None) for s in secours})
-        for f, (classe, sym, nom) in futs.items():
-            try:
-                data[sym] = (classe, nom, f.result())
-            except Exception as e:
-                erreurs.append({"symbole": sym, "classe": classe, "erreur": str(e)[:80]})
-        for f, (name, t) in cfuts.items():
-            r = f.result()
-            if r:
-                data[r[0]] = ("Crypto", name, r[1])
-            else:
-                erreurs.append({"symbole": f"{t}-USD", "classe": "Crypto", "erreur": "symbole Yahoo introuvable ou cours incohérent"})
+    for sym, classe in classe_de.items():
+        d = brut.get(sym)
+        if not d:
+            erreurs.append({"symbole": sym, "classe": classe, "erreur": "aucun cours renvoyé par Yahoo"})
+        elif sym in ref and ref[sym] and abs(d["cours"] / ref[sym] - 1) > 0.03:
+            erreurs.append({"symbole": sym, "classe": classe, "erreur": "cours Yahoo incohérent avec le classement (autre jeton du même nom)"})
+        else:
+            data[sym] = (classe, noms.get(sym), d)
+    attendu = len(classe_de)
     os.makedirs(os.path.join(outdir, "barres"), exist_ok=True)
     for sym, (classe, nom, d) in data.items():
         st = stats(d)
         if not st:
             erreurs.append({"symbole": sym, "classe": classe, "erreur": "aucune barre"})
             continue
+        st["negociable"] = time.time() - d["heure"] < 5400      # dernière barre commencée il y a moins de 90 minutes
         instruments.append({"classe": classe, "symbole": sym, "nom": nom, "fichier": fichier(sym) + ".json", **st})
         with open(os.path.join(outdir, "barres", fichier(sym) + ".json"), "w") as f:
             json.dump({"symbole": sym, "cours": d["cours"], "heure": d["heure"],
@@ -155,7 +153,6 @@ def main(outdir):
               "nb_instruments": len(instruments), "instruments": instruments, "erreurs": erreurs}
     with open(os.path.join(outdir, "resume.json"), "w", encoding="utf-8") as f:
         json.dump(resume, f, ensure_ascii=False, separators=(",", ":"))
-    attendu = len(jobs) + (len(cfuts) or len(secours))
     print(f"{len(instruments)} instruments relevés sur {attendu}, {len(erreurs)} erreurs, crypto : {source_crypto}")
     for e in erreurs[:40]:
         print("  erreur", e)
