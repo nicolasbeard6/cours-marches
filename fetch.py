@@ -18,6 +18,11 @@ STABLES = {"usdt", "usdc", "dai", "usds", "usde", "fdusd", "pyusd", "tusd", "usd
            "susde", "susds", "usd0", "gho", "frax", "eurs", "eurc", "usdg", "usdx", "usdy", "usyc", "buidl", "xaut", "paxg",
            "steth", "wsteth", "weth", "wbtc", "cbbtc", "weeth", "wbeth", "lbtc", "reth", "meth", "jitosol", "bnsol", "ezeth",
            "rseth", "solvbtc", "tbtc", "fbtc", "jlp", "msol", "ousg", "usdo", "usual"}
+# Symboles Yahoo particuliers (suffixe numérique). Chacun est vérifié par comparaison de cours avant d'être retenu.
+ALIAS = {"HYPE": "HYPE32196-USD", "UNI": "UNI7083-USD", "SUI": "SUI20947-USD", "TAO": "TAO22974-USD",
+         "PEPE": "PEPE24478-USD", "MNT": "MNT27075-USD", "TON": "TON11419-USD", "APT": "APT21794-USD",
+         "ARB": "ARB11841-USD", "POL": "POL28321-USD", "STX": "STX4847-USD", "IMX": "IMX10603-USD",
+         "GRT": "GRT6719-USD", "JUP": "JUP29210-USD"}
 MOTS_EXCLUS = ("wrapped", "staked", "staking", "bridged", "restaked", "liquid staking", "tether", "usd coin", "stablecoin")
 
 
@@ -118,8 +123,12 @@ def main(outdir):
         else:
             classe_de.update({s: classe for s in syms})
     try:
-        for name, t, px in top_crypto():
-            classe_de[f"{t}-USD"], noms[f"{t}-USD"], ref[f"{t}-USD"] = "Crypto", name, px
+        for name, t, px in top_crypto(75):               # 75 candidates, on garde les 50 premières valides
+            if not re.fullmatch(r"[A-Z0-9]{1,10}", t):
+                continue
+            for sym in (f"{t}-USD", ALIAS.get(t)):
+                if sym:
+                    classe_de[sym], noms[sym], ref[sym] = "Crypto", name, px
         source_crypto = "classement CoinGecko"
     except Exception as e:
         print("CoinGecko indisponible :", e)
@@ -135,7 +144,15 @@ def main(outdir):
             erreurs.append({"symbole": sym, "classe": classe, "erreur": "cours Yahoo incohérent avec le classement (autre jeton du même nom)"})
         else:
             data[sym] = (classe, noms.get(sym), d)
-    attendu = len(classe_de)
+    # crypto : une seule ligne par jeton, 50 au plus, dans l'ordre du classement ; les alias sans cours ne sont pas des erreurs
+    vus, garde = set(), 0
+    for sym in [x for x in classe_de if classe_de[x] == "Crypto"]:
+        if sym in data and (noms.get(sym) in vus or garde >= 50):
+            del data[sym]
+        elif sym in data:
+            vus.add(noms.get(sym)); garde += 1
+    erreurs = [e for e in erreurs if not (e["classe"] == "Crypto" and (noms.get(e["symbole"]) in vus or e["symbole"] in ALIAS.values()))]
+    attendu = len([x for x in classe_de if classe_de[x] != "Crypto"]) + 50
     os.makedirs(os.path.join(outdir, "barres"), exist_ok=True)
     for sym, (classe, nom, d) in data.items():
         st = stats(d)
