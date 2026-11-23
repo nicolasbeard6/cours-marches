@@ -113,4 +113,4 @@ if __name__ == "__main__":
     print(json.dumps({"version": VERSION, "symbole": sym, "dernier_cours": last,
                       "heure_dernier_cours": fmt(last_t) if last_t else None,
                       "entree": None if entry is not None else fill, "sortie": out,
-                      "stop_actuel": round(sl_now, 8), "ombres": res_ombres}, ensure_ascii=False)), ensure_ascii=False))
+                      "stop_actuel": round(sl_now, 8), "ombres": res_ombres}, ensure_ascii=False))
