@@ -1,4 +1,4 @@
-# suivi.py (version 2) : dit si un ordre a été exécuté et si son stop ou son take profit a été touché depuis une date.
+# suivi.py (version 3) : dit si un ordre a été exécuté et si son stop ou son take profit a été touché depuis une date.
 # Lit les barres d'une heure publiées dans la branche "data" de ce dépôt.
 # Usage : python3 suivi.py SYMBOLE SENS NIVEAU STOP TP "AAAA-MM-JJ HH:MM" [COURS_ENTREE] [--suiveur DISTANCE]
 #   SENS = ACHAT ou VENTE ; la date est en heure de Paris (création de l'ordre, ou ouverture si COURS_ENTREE est donné).
@@ -7,6 +7,11 @@
 #   --suiveur DISTANCE (en unités de cours) : stop suiveur. Après chaque barre, le stop est rapproché à DISTANCE du
 #   meilleur cours atteint depuis l'entrée (plus haut pour un achat, plus bas pour une vente) ; il ne recule jamais.
 #   Le nouveau stop ne s'applique qu'à partir de la barre suivante (hypothèse prudente).
+#   --ombre DISTANCE (répétable, version 3) : pour une position ouverte (ou close, avec sa date et son cours
+#   d'entrée), calcule aussi la sortie qu'aurait donnée un stop suiveur plus large, à DISTANCE du meilleur cours,
+#   sans take profit et avec le même stop initial (même risque). Sert à comparer les réglages sans créer de trades.
+#   --duree JOURS (version 3) : pour les ombres, sortie à la clôture de la première barre après JOURS jours si le
+#   stop n'a pas encore dépassé le cours d'entrée (même règle que la durée maximale des trades v2).
 # Règles prudentes : si le stop et le take profit sont touchés dans la même barre, le stop est retenu ;
 # si le cours saute par-dessus le stop, la sortie se fait au cours d'ouverture de la barre.
 import json, os, re, subprocess, sys
@@ -14,7 +19,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 PARIS = ZoneInfo("Europe/Paris")
 BASE = os.environ.get("COURS_BASE", "https://raw.githubusercontent.com/nicolasbeard6/cours-marches/data")
-VERSION = 2
+VERSION = 3
 
 
 def bars(sym):
@@ -26,7 +31,7 @@ def bars(sym):
     return [tuple(b) for b in r["barres"]], r.get("cours"), r.get("heure")
 
 
-def resolve(data, side, lvl, sl, tp, since, entry=None, trail=None):
+def resolve(data, side, lvl, sl, tp, since, entry=None, trail=None, duree=None):
     """data : liste (t, open, high, low, close). Renvoie (entree, sortie, stop_actuel) ; entree et sortie valent None ou un dict."""
     long = side == "ACHAT"
     tp = tp if tp and tp > 0 else None
@@ -58,6 +63,8 @@ def resolve(data, side, lvl, sl, tp, since, entry=None, trail=None):
                 return fill, {"t": t, "px": sl, "motif": "stop"}, sl
             ratchet(h, l)
             continue
+        if duree and t >= since + duree * 86400 and ((long and sl <= fill["px"]) or (not long and sl >= fill["px"])):
+            return fill, {"t": t, "px": c, "motif": "durée max"}, sl
         if long:
             if o <= sl: return fill, {"t": t, "px": o, "motif": motif("stop (écart)")}, sl
             if l <= sl: return fill, {"t": t, "px": sl, "motif": motif("stop")}, sl
@@ -73,7 +80,15 @@ def resolve(data, side, lvl, sl, tp, since, entry=None, trail=None):
 
 
 if __name__ == "__main__":
-    args, trail = list(sys.argv[1:]), None
+    args, trail, ombres, duree = list(sys.argv[1:]), None, [], None
+    while "--ombre" in args:
+        i = args.index("--ombre")
+        ombres.append(float(args[i + 1]))
+        del args[i:i + 2]
+    if "--duree" in args:
+        i = args.index("--duree")
+        duree = float(args[i + 1])
+        del args[i:i + 2]
     if "--suiveur" in args:
         i = args.index("--suiveur")
         trail = float(args[i + 1])
@@ -88,7 +103,14 @@ if __name__ == "__main__":
     fmt = lambda t: datetime.fromtimestamp(t, PARIS).strftime("%Y-%m-%d %H:%M")
     for d in (fill, out):
         if d: d["heure"] = fmt(d.pop("t"))
+    res_ombres = []
+    if ombres and fill is not None:
+        e_t = since if entry is not None else datetime.strptime(fill["heure"], "%Y-%m-%d %H:%M").replace(tzinfo=PARIS).timestamp()
+        for d in ombres:
+            _, o_out, o_sl = resolve(data, side, 0, sl, 0, e_t, fill["px"], d, duree)
+            if o_out: o_out["heure"] = fmt(o_out.pop("t"))
+            res_ombres.append({"distance": d, "sortie": o_out, "stop_actuel": round(o_sl, 8)})
     print(json.dumps({"version": VERSION, "symbole": sym, "dernier_cours": last,
                       "heure_dernier_cours": fmt(last_t) if last_t else None,
                       "entree": None if entry is not None else fill, "sortie": out,
-                      "stop_actuel": round(sl_now, 8)}, ensure_ascii=False))
+                      "stop_actuel": round(sl_now, 8), "ombres": res_ombres}, ensure_ascii=False)), ensure_ascii=False))
