@@ -23,6 +23,16 @@ jobs:
         run: pip install -q yfinance
       - name: Relever les cours
         run: python fetch.py out
+      - name: Reprendre l'état du bot de tendance (branche data)
+        run: |
+          mkdir -p out/tendance
+          git fetch -q --depth=1 origin data      # en cas d'échec, le relevé s'arrête ici et l'état précédent est conservé
+          for f in etat.json historique.json; do
+            git show "origin/data:tendance/$f" > "out/tendance/$f" 2>/dev/null || rm -f "out/tendance/$f"   # absent au premier passage
+          done
+      - name: Bot de tendance automatique (référence du journal)
+        continue-on-error: true                  # une erreur ici ne bloque pas la publication des cours ; l'état précédent est gardé
+        run: python tendance.py out
       - name: Publier dans la branche data (un seul commit, remplacé à chaque relevé)
         run: |
           cd out
