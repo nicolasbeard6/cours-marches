@@ -1,6 +1,6 @@
 """Relève les cours (Yahoo Finance, barres d'une heure sur un mois) de tous les instruments de univers.json,
 plus les 50 premières cryptos par capitalisation (classement CoinGecko), et écrit :
-  out/resume.json            un résumé chiffré par instrument
+  out/resume.json            un résumé chiffré par instrument (dont var_3m, var_6m, var_12m et, pour la crypto, rang)
   out/barres/<fichier>.json  les barres [t, ouverture, haut, bas, clôture] de chaque instrument
 Dépendance : yfinance. Usage : python fetch.py [dossier_de_sortie]
 """
@@ -68,6 +68,45 @@ def load(symbols, lot=40):
     return out
 
 
+def load_daily(symbols, lot=60):
+    """Clôtures quotidiennes sur un an (pour les variations sur 3, 6 et 12 mois). Renvoie {symbole: [(t, clôture)]}."""
+    import yfinance as yf
+    out = {}
+    for i in range(0, len(symbols), lot):
+        part = symbols[i:i + lot]
+        try:
+            df = yf.download(part, period="1y", interval="1d", group_by="ticker", auto_adjust=False,
+                             progress=False, threads=True)
+        except Exception as e:
+            print("lot quotidien en échec :", str(e)[:120])
+            continue
+        for s in part:
+            try:
+                sub = df[s]["Close"].dropna()
+            except Exception:
+                continue
+            if not sub.empty:
+                out[s] = [(int(t.timestamp()), float(c)) for t, c in zip(sub.index, sub.to_numpy())]
+        time.sleep(1)
+    return out
+
+
+def var_longue(daily, last, now, jours):
+    """Variation depuis la dernière clôture quotidienne datée d'au moins `jours` jours ; None si l'historique est trop court."""
+    if not daily or not last:
+        return None
+    limite = now - jours * 86400
+    ref = None
+    for t, c in daily:
+        if t <= limite:
+            ref = c
+        else:
+            break
+    if ref is None or daily[0][0] > limite + 10 * 86400:
+        return None
+    return round(last / ref - 1, 5)
+
+
 def sig(x, n=7):
     return float(f"{x:.{n}g}")
 
@@ -116,19 +155,19 @@ def top_crypto(n=50):
 
 def main(outdir):
     uni = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "univers.json"), encoding="utf-8"))
-    classe_de, noms, secours, ref = {}, {}, [], {}
+    classe_de, noms, secours, ref, rang_brut = {}, {}, [], {}, {}
     for classe, syms in uni.items():
         if classe.startswith("Crypto"):
             secours = syms
         else:
             classe_de.update({s: classe for s in syms})
     try:
-        for name, t, px in top_crypto(75):               # 75 candidates, on garde les 50 premières valides
+        for k, (name, t, px) in enumerate(top_crypto(75)):   # 75 candidates, on garde les 50 premières valides
             if not re.fullmatch(r"[A-Z0-9]{1,10}", t):
                 continue
             for sym in (f"{t}-USD", ALIAS.get(t)):
                 if sym:
-                    classe_de[sym], noms[sym], ref[sym] = "Crypto", name, px
+                    classe_de[sym], noms[sym], ref[sym], rang_brut[sym] = "Crypto", name, px, k
         source_crypto = "classement CoinGecko"
     except Exception as e:
         print("CoinGecko indisponible :", e)
@@ -145,14 +184,16 @@ def main(outdir):
         else:
             data[sym] = (classe, noms.get(sym), d)
     # crypto : une seule ligne par jeton, 50 au plus, dans l'ordre du classement ; les alias sans cours ne sont pas des erreurs
-    vus, garde = set(), 0
-    for sym in [x for x in classe_de if classe_de[x] == "Crypto"]:
+    vus, garde, rang = set(), 0, {}
+    for sym in sorted([x for x in classe_de if classe_de[x] == "Crypto"], key=lambda x: rang_brut.get(x, 999)):
         if sym in data and (noms.get(sym) in vus or garde >= 50):
             del data[sym]
         elif sym in data:
-            vus.add(noms.get(sym)); garde += 1
+            vus.add(noms.get(sym)); garde += 1; rang[sym] = garde
     erreurs = [e for e in erreurs if not (e["classe"] == "Crypto" and (noms.get(e["symbole"]) in vus or e["symbole"] in ALIAS.values()))]
     attendu = len([x for x in classe_de if classe_de[x] != "Crypto"]) + 50
+    quotidien = load_daily(list(data))
+    maintenant = time.time()
     os.makedirs(os.path.join(outdir, "barres"), exist_ok=True)
     for sym, (classe, nom, d) in data.items():
         st = stats(d)
@@ -160,13 +201,19 @@ def main(outdir):
             erreurs.append({"symbole": sym, "classe": classe, "erreur": "aucune barre"})
             continue
         st["negociable"] = time.time() - d["heure"] < 5400      # dernière barre commencée il y a moins de 90 minutes
+        q = quotidien.get(sym)
+        st["var_3m"] = var_longue(q, d["cours"], maintenant, 91)
+        st["var_6m"] = var_longue(q, d["cours"], maintenant, 182)
+        st["var_12m"] = var_longue(q, d["cours"], maintenant, 350)
+        if classe == "Crypto":
+            st["rang"] = rang.get(sym)
         instruments.append({"classe": classe, "symbole": sym, "nom": nom, "fichier": fichier(sym) + ".json", **st})
         with open(os.path.join(outdir, "barres", fichier(sym) + ".json"), "w") as f:
             json.dump({"symbole": sym, "cours": d["cours"], "heure": d["heure"],
                        "barres": [[b[0]] + [sig(x) for x in b[1:]] for b in d["bars"]]}, f, separators=(",", ":"))
     instruments.sort(key=lambda x: (x["classe"], x["symbole"]))
     resume = {"maj_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"), "maj_epoch": int(time.time()),
-              "source": "Yahoo Finance, barres d'une heure sur un mois", "liste_crypto": source_crypto,
+              "source": "Yahoo Finance, barres d'une heure sur un mois et clôtures quotidiennes sur un an", "liste_crypto": source_crypto,
               "nb_instruments": len(instruments), "instruments": instruments, "erreurs": erreurs}
     with open(os.path.join(outdir, "resume.json"), "w", encoding="utf-8") as f:
         json.dump(resume, f, ensure_ascii=False, separators=(",", ":"))
