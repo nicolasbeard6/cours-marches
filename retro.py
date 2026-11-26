@@ -52,7 +52,7 @@ def reconstituer(c, debut_txt, maintenant):
 
         def accepter(a):
             try:
-                fills, depart = {}, _ms(debut)
+                fills, depart = {}, _ms(debut - timedelta(days=7))   # la semaine d'avant : le compte doit être actif
                 for _ in range(6):
                     lot = lire(f"fills/{a}.json") if simu else lire(None, corps={"type": "userFillsByTime", "user": a,
                                                                                "startTime": depart})
@@ -65,6 +65,8 @@ def reconstituer(c, debut_txt, maintenant):
                 if len(fills) >= MAX_TRADES:
                     exclus.append(a)
                     return False
+                if not any(f["time"] < _ms(debut) for f in fills.values()):
+                    return False                                  # aucun trade la semaine avant le début : inactif
                 port = c.hl_info({"type": "portfolio", "user": a})
                 port = {n: d for n, d in port} if isinstance(port, list) else port
                 hist_v = (port.get("perpMonth") or port.get("month") or {}).get("accountValueHistory", [])

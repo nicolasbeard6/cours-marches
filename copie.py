@@ -61,8 +61,8 @@ HEURE_UTC = 15
 HL_ANCIENNETE_MIN = 90       # jours d'historique au moins (sinon chance ou contexte favorable)
 HL_BAISSE_MAX = 0.40         # pire baisse de l'équité ≤ 40 %
 HL_LEVIER_MAX = 10.0         # exposition brute ≤ 10 fois la valeur du compte au moment du choix
-HL_ROTATION_MAX = 200.0      # volume du mois ≤ 200 fois la valeur du compte (écarte les teneurs de marché)
-HL_PRESELECTION = 40         # comptes examinés en détail à chaque revue
+HL_ROTATION_MAX = 30.0       # volume du mois ≤ 30 fois la valeur du compte (écarte teneurs de marché et traders trop rapides à suivre)
+HL_PRESELECTION = 60         # comptes examinés en détail à chaque revue (par gain de la période en $)
 HL_PART_MAX_ACTIF = 0.30     # un actif ≤ 30 % de la valeur du bot (somme des comptes copiés)
 HL_PART_MAX_SENS = 0.60      # exposition nette dans un sens ≤ 60 % de la valeur du bot
 
@@ -177,25 +177,38 @@ def hl_classement():
     return lignes.get("leaderboardRows", lignes) if isinstance(lignes, dict) else lignes
 
 
+def _indice(av, pnl):
+    """Rendement pondéré dans le temps : chaque variation du gain cumulé est rapportée à la valeur du compte juste
+    avant, ce qui neutralise dépôts et retraits. Renvoie (rendement total, pire baisse)."""
+    valeurs = dict(av)
+    ind, pic, baisse, prec, v_prec = 1.0, 1.0, 0.0, None, None
+    for t, g in pnl:
+        v = valeurs.get(t)
+        if prec is not None and v_prec and v_prec > 1000:
+            ind *= max(0.0, 1 + (g - prec) / v_prec)
+            pic = max(pic, ind)
+            baisse = max(baisse, (pic - ind) / pic if pic else 0.0)
+        prec, v_prec = g, v if v is not None else v_prec
+    return ind - 1, baisse
+
+
 def hl_evaluer(adresse, jusqua_ms=None, avec_levier=True):
-    """Qualité d'un compte d'après son historique public (portfolio, fenêtre allTime), coupé à jusqua_ms :
-    ancienneté (jours), pire baisse de l'équité, rendement total, levier actuel. None si l'historique manque."""
+    """Qualité d'un compte d'après son historique public (portfolio), coupé à jusqua_ms : ancienneté (jours, fenêtre
+    allTime), rendement et pire baisse pondérés dans le temps (fenêtres allTime et month), levier actuel."""
     port = hl_info({"type": "portfolio", "user": adresse})
     port = {n: d for n, d in port} if isinstance(port, list) else port
-    w = port.get("perpAllTime") or port.get("allTime") or {}
-    av = [(int(t), float(v)) for t, v in w.get("accountValueHistory", []) if jusqua_ms is None or int(t) <= jusqua_ms]
-    pnl = [(int(t), float(v)) for t, v in w.get("pnlHistory", []) if jusqua_ms is None or int(t) <= jusqua_ms]
+    res = {}
+    for nom in ("allTime", "month"):
+        w = port.get("perp" + nom[0].upper() + nom[1:]) or port.get(nom) or {}
+        av = [(int(t), float(v)) for t, v in w.get("accountValueHistory", []) if jusqua_ms is None or int(t) <= jusqua_ms]
+        pnl = [(int(t), float(v)) for t, v in w.get("pnlHistory", []) if jusqua_ms is None or int(t) <= jusqua_ms]
+        res[nom] = (av, pnl)
+    av, pnl = res["allTime"]
     if len(av) < 2 or len(pnl) < 2:
         return None
-    base = av[-1][1] - pnl[-1][1]                    # dépôts nets approchés : équité = base + gain cumulé
-    pic, baisse = None, 0.0
-    for _, g in pnl:
-        eq = base + g
-        if pic is None or eq > pic:
-            pic = eq
-        if pic and pic > 0:
-            baisse = max(baisse, (pic - eq) / pic)
-    rend = pnl[-1][1] / base if base > 0 else pnl[-1][1] / max(av[-1][1], 1.0)
+    rend, baisse = _indice(av, pnl)
+    if len(res["month"][1]) >= 2:
+        baisse = max(baisse, _indice(*res["month"])[1])
     levier = None
     if avec_levier:
         e = hl_info({"type": "clearinghouseState", "user": adresse})
@@ -203,30 +216,29 @@ def hl_evaluer(adresse, jusqua_ms=None, avec_levier=True):
         levier = (nombre(m.get("totalNtlPos")) or 0.0) / max(nombre(m.get("accountValue")) or 1.0, 1.0)
     return {"anciennete_j": round((av[-1][0] - av[0][0]) / 86400000, 1), "pire_baisse": round(baisse, 4),
             "rendement": round(rend, 4), "levier": None if levier is None else round(levier, 2),
-            "score": round(rend / max(baisse, 0.05), 4)}
+            "score": round(rend / max(baisse, 0.10), 4)}
 
 
 def hl_preselection(lignes, gain_cle):
     """Filtre du classement : valeur ≥ VALEUR_MIN, gagnant depuis le début et sur la période gain_cle(p) > 0,
-    actif sur le mois sans être un teneur de marché (rotation ≤ HL_ROTATION_MAX). Classés par rendement total."""
+    actif sur le mois sans être un teneur de marché (rotation ≤ HL_ROTATION_MAX). Classés par gain de la période en $."""
     cand = []
     for r in lignes:
         try:
             v, p = float(r["accountValue"]), fenetres(r["windowPerformances"])
             tout, g, vlm = float(p["allTime"]["pnl"]), gain_cle(p), float(p["month"]["vlm"])
-            roi = float(p["allTime"].get("roi") or 0)
         except (KeyError, TypeError, ValueError):
             continue
         if v >= VALEUR_MIN and tout > 0 and g > 0 and 0 < vlm <= HL_ROTATION_MAX * v:
             cand.append({"id": r["ethAddress"].lower(), "nom": r.get("displayName") or "", "valeur": round(v, 2),
-                         "gain_periode": round(g, 2), "roi_total": roi})
-    cand.sort(key=lambda x: -x["roi_total"])
+                         "gain_periode": round(g, 2)})
+    cand.sort(key=lambda x: -x["gain_periode"])
     return cand
 
 
 def hl_retenir(cand, jusqua_ms=None, avec_levier=True, accepter=lambda a: True):
     """Examine les candidats dans l'ordre : ancienneté, pire baisse et levier ; classe les admis par
-    rendement ÷ pire baisse (au moins 5 %) et garde les N_COMPTES meilleurs."""
+    rendement ÷ pire baisse (au moins 10 %), rendement positif exigé, et garde les N_COMPTES meilleurs."""
     admis = []
     for k in cand[:HL_PRESELECTION]:
         try:
@@ -234,7 +246,7 @@ def hl_retenir(cand, jusqua_ms=None, avec_levier=True, accepter=lambda a: True):
             time.sleep(0 if SIMU else 0.5)
         except Exception:
             continue
-        if not q or q["anciennete_j"] < HL_ANCIENNETE_MIN or q["pire_baisse"] > HL_BAISSE_MAX:
+        if not q or q["anciennete_j"] < HL_ANCIENNETE_MIN or q["pire_baisse"] > HL_BAISSE_MAX or q["rendement"] <= 0:
             continue
         if q["levier"] is not None and q["levier"] > HL_LEVIER_MAX:
             continue
@@ -664,7 +676,7 @@ BOTS = (("Hyperliquid", "Crypto", bot_hyperliquid), ("ARKK", "Actions", bot_arkk
 
 
 DEBUT_RETRO = "2026-11-16 12:43"   # UTC : premier trade du journal (T0001, 16/11/2026 13:43 heure de Paris)
-RETRO_VERSION = 2                  # changer ce numéro relance une reconstitution complète (règles modifiées)
+RETRO_VERSION = 3                  # changer ce numéro relance une reconstitution complète (règles modifiées)
 
 
 def main(dossier):
