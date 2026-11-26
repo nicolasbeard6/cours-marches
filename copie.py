@@ -693,7 +693,9 @@ def trump_suivi():
 
 
 def wlfi_soldes():
-    """Soldes du multisig de World Liberty : {symbole: quantité} (jetons ERC-20 et ETH)."""
+    """Soldes du multisig de World Liberty : {adresse du jeton: {"sym", "q", "prix"}} (prix Blockscout, None si
+    inconnu). Les jetons parasites envoyés au portefeuille portent souvent le nom d'une vraie crypto : ils sont
+    écartés plus loin en comparant leur prix au cours réel."""
     if SIMU:
         return _simu("wlfi.json")
     out = {}
@@ -702,10 +704,11 @@ def wlfi_soldes():
         sym, dec = (tok.get("symbol") or "").upper(), int(tok.get("decimals") or 0)
         q = nombre(it.get("value"))
         if sym and q:
-            out[sym] = out.get(sym, 0.0) + q / 10 ** dec
+            out[(tok.get("address_hash") or tok.get("address") or sym).lower()] = {
+                "sym": sym, "q": q / 10 ** dec, "prix": nombre(tok.get("exchange_rate"))}
     try:
         a = json.loads(_http(f"https://eth.blockscout.com/api/v2/addresses/{WLFI_ADRESSE}", timeout=40))
-        out["ETH"] = out.get("ETH", 0.0) + (nombre(a.get("coin_balance")) or 0) / 1e18
+        out["eth"] = {"sym": "ETH", "q": (nombre(a.get("coin_balance")) or 0) / 1e18, "prix": nombre(a.get("exchange_rate"))}
     except Exception:
         pass
     return out
@@ -744,16 +747,17 @@ def bot_trump(bot, now, quand, mouvements):
     # poche crypto : à chaque relevé
     try:
         mids = {c: float(x) for c, x in hl_info({"type": "allMids"}).items() if not c.startswith("@") and nombre(x)}
-        q = wlfi_soldes()
         pos, liq = {}, 0.0
-        for sym, n in q.items():
-            if sym in WLFI_EXCLUS:
+        for j in wlfi_soldes().values():
+            sym, n, px = j["sym"], j["q"], j.get("prix")
+            if sym in WLFI_EXCLUS or not px:          # sans prix connu : jeton parasite ou sans marché
                 continue
             if sym in STABLES:
-                liq += n
+                if 0.95 < px < 1.05:
+                    liq += n
                 continue
             coin = ALIAS_HL.get(sym, sym)
-            if coin in mids:                          # seuls les jetons qui ont un marché liquide sont copiés
+            if coin in mids and abs(px / mids[coin] - 1) < 0.20:   # vrai jeton : prix cohérent avec le marché
                 pos[coin] = pos.get(coin, 0.0) + n
         val = liq + sum(n * mids[c] for c, n in pos.items())
         w = bot["poches"]["wlfi"]
@@ -772,7 +776,7 @@ BOTS = (("Hyperliquid", "Crypto", bot_hyperliquid), ("ARKK", "Actions", bot_arkk
 
 
 DEBUT_RETRO = "2026-11-16 12:43"   # UTC : premier trade du journal (T0001, 16/11/2026 13:43 heure de Paris)
-RETRO_VERSION = 5                  # changer ce numéro relance une reconstitution complète (règles modifiées)
+RETRO_VERSION = 6                  # changer ce numéro relance une reconstitution complète (règles modifiées)
 
 
 def main(dossier):

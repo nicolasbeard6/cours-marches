@@ -49,8 +49,9 @@ def reconstituer(c, debut_txt, maintenant):
     try:
         wl["actuel"] = origine["wlfi_soldes"]()
         mids_now = origine["hl_info"]({"type": "allMids"})
-        wl["coins"] = {c.ALIAS_HL.get(s_, s_) for s_ in wl["actuel"] if s_ not in c.STABLES and s_ not in c.WLFI_EXCLUS
-                       and c.ALIAS_HL.get(s_, s_) in mids_now}
+        wl["coins"] = {c.ALIAS_HL.get(j["sym"], j["sym"]) for j in wl["actuel"].values() if j.get("prix")
+                       and j["sym"] not in c.STABLES and j["sym"] not in c.WLFI_EXCLUS
+                       and c.ALIAS_HL.get(j["sym"], j["sym"]) in mids_now}
         if simu:
             wl["transferts"] = lire("wlfi_transferts.json")
         else:
@@ -65,7 +66,7 @@ def reconstituer(c, debut_txt, maintenant):
                     tok, tot = it.get("token") or {}, it.get("total") or {}
                     q = (c.nombre(tot.get("value")) or 0) / 10 ** int(tot.get("decimals") or tok.get("decimals") or 0)
                     sens = 1 if (it.get("to") or {}).get("hash", "").lower() == c.WLFI_ADRESSE else -1
-                    wl["transferts"].append((_ms(t_), (tok.get("symbol") or "").upper(), sens * q))
+                    wl["transferts"].append((_ms(t_), (tok.get("address_hash") or tok.get("address") or "").lower(), sens * q))
                 if complet or not r.get("next_page_params"):
                     complet = True
                     break
@@ -78,11 +79,11 @@ def reconstituer(c, debut_txt, maintenant):
 
     def wlfi_soldes():
         t = _ms(horloge["T"])
-        q = dict(wl["actuel"])
-        for ti, sym, d in wl["transferts"]:
-            if ti > t:
-                q[sym] = q.get(sym, 0.0) - d
-        return {k: v for k, v in q.items() if v > 1e-12}
+        q = {a: dict(j) for a, j in wl["actuel"].items()}
+        for ti, adr, d in wl["transferts"]:
+            if ti > t and adr in q:                   # jetons déjà connus (les autres n'ont pas de prix fiable)
+                q[adr]["q"] -= d
+        return {a: j for a, j in q.items() if j["q"] > 1e-12}
 
     cache_trump = {}
 
