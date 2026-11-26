@@ -13,7 +13,7 @@ concurrency:
 jobs:
   releve:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -41,7 +41,7 @@ jobs:
           done
       - name: Bots de copie (Hyperliquid, ARKK, sénateurs, Buffett - référence du journal)
         continue-on-error: true                  # une erreur ici ne bloque pas la publication des cours ; l'état précédent est gardé
-        timeout-minutes: 12
+        timeout-minutes: 25
         run: python copie.py out
       - name: Publier dans la branche data (un seul commit, remplacé à chaque relevé)
         run: |
