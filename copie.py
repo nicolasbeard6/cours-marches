@@ -757,7 +757,7 @@ def bot_trump(bot, now, quand, mouvements):
                     liq += n
                 continue
             coin = ALIAS_HL.get(sym, sym)
-            if coin in mids and abs(px / mids[coin] - 1) < 0.20:   # vrai jeton : prix cohérent avec le marché
+            if coin in mids and 0.5 < px / mids[coin] < 2.0:   # vrai jeton : prix du même ordre que le marché (Blockscout peut être en retard)
                 pos[coin] = pos.get(coin, 0.0) + n
         val = liq + sum(n * mids[c] for c, n in pos.items())
         w = bot["poches"]["wlfi"]
@@ -776,7 +776,7 @@ BOTS = (("Hyperliquid", "Crypto", bot_hyperliquid), ("ARKK", "Actions", bot_arkk
 
 
 DEBUT_RETRO = "2026-11-16 12:43"   # UTC : premier trade du journal (T0001, 16/11/2026 13:43 heure de Paris)
-RETRO_VERSION = 6                  # changer ce numéro relance une reconstitution complète (règles modifiées)
+RETRO_VERSION = 7                  # changer ce numéro relance une reconstitution complète (règles modifiées)
 
 
 def main(dossier):
