@@ -770,13 +770,39 @@ def bot_trump(bot, now, quand, mouvements):
     return cours_tout
 
 
+# Références « acheter et garder » : achetées au départ (mêmes frais), jamais revendues ni rééquilibrées.
+# Elles répondent à la règle du journal : un bot doit battre une référence simple sur la même période.
+REFERENCES = {"Réf. S&P 500": ("Actions", {"SPY": 1.0}),
+              "Réf. Bitcoin": ("Crypto", {"BTC-USD": 1.0}),
+              "Réf. 60/40": ("Actions", {"VT": 0.6, "BND": 0.4})}   # 60 % actions mondiales, 40 % obligations
+
+
+def bot_reference(nom):
+    classe, poids = REFERENCES[nom]
+
+    def fn(bot, now, quand, mouvements):
+        prix = cours_yahoo(set(poids))
+        cours = {t: dernier(s) for t, s in prix.items() if s}
+        if not bot["poches"]:
+            revoir(bot, [{"id": "ref", "nom": " + ".join(f"{int(w * 100)} % {t}" for t, w in poids.items())}],
+                   cours, quand, mouvements, nom)
+        p = bot["poches"]["ref"]
+        if not p["lignes"] and all(t in cours for t in poids):          # achat unique au départ
+            bot["frais_cumules"] += reproduire(p, {t: w * 1e6 / cours[t] for t, w in poids.items()}, 1e6, cours,
+                                               classe, quand, mouvements, nom)
+        else:
+            p["dernier_cours"].update({t: x for t, x in cours.items() if t in p["lignes"]})
+        return dict(p["dernier_cours"])
+    return fn
+
+
 BOTS = (("Hyperliquid", "Crypto", bot_hyperliquid), ("ARKK", "Actions", bot_arkk),
         ("Sénateurs", "Actions", bot_senateurs), ("Buffett", "Actions", bot_buffett),
-        ("Trump", "Mixte", bot_trump))
+        ("Trump", "Mixte", bot_trump)) + tuple((n, c, bot_reference(n)) for n, (c, _) in REFERENCES.items())
 
 
 DEBUT_RETRO = "2026-11-16 12:43"   # UTC : premier trade du journal (T0001, 16/11/2026 13:43 heure de Paris)
-RETRO_VERSION = 7                  # changer ce numéro relance une reconstitution complète (règles modifiées)
+RETRO_VERSION = 8                  # changer ce numéro relance une reconstitution complète (règles modifiées)
 
 
 def main(dossier):
