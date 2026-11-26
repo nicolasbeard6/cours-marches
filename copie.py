@@ -62,7 +62,7 @@ HL_ANCIENNETE_MIN = 90       # jours d'historique au moins (sinon chance ou cont
 HL_BAISSE_MAX = 0.40         # pire baisse de l'équité ≤ 40 %
 HL_LEVIER_MAX = 10.0         # exposition brute ≤ 10 fois la valeur du compte au moment du choix
 HL_ROTATION_MAX = 30.0       # volume du mois ≤ 30 fois la valeur du compte (écarte teneurs de marché et traders trop rapides à suivre)
-HL_PRESELECTION = 60         # comptes examinés en détail à chaque revue (par gain de la période en $)
+HL_PRESELECTION = 200        # comptes examinés en détail à chaque revue (par gain de la période en $)
 HL_PART_MAX_ACTIF = 0.30     # un actif ≤ 30 % de la valeur du bot (somme des comptes copiés)
 HL_PART_MAX_SENS = 0.60      # exposition nette dans un sens ≤ 60 % de la valeur du bot
 
@@ -676,7 +676,7 @@ BOTS = (("Hyperliquid", "Crypto", bot_hyperliquid), ("ARKK", "Actions", bot_arkk
 
 
 DEBUT_RETRO = "2026-11-16 12:43"   # UTC : premier trade du journal (T0001, 16/11/2026 13:43 heure de Paris)
-RETRO_VERSION = 3                  # changer ce numéro relance une reconstitution complète (règles modifiées)
+RETRO_VERSION = 4                  # changer ce numéro relance une reconstitution complète (règles modifiées)
 
 
 def main(dossier):
