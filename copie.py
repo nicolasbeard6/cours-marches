@@ -671,12 +671,108 @@ def bot_buffett(bot, now, quand, mouvements):
     return dict(p["dernier_cours"])
 
 
+# Trump : deux poches de même taille.
+#  - « oge » : portefeuille boursier de Donald Trump d'après ses déclarations OGE 278-T, compilé par tracefour.com
+#    (tracker trump-portfolio, CC BY 4.0) : lignes avec symbole (actions et fonds) au prorata de leur valeur ; les
+#    obligations et soldes sans symbole restent en liquidités. Recopié à chaque nouvelle déclaration.
+#  - « wlfi » : actifs liquides du portefeuille multisig public de World Liberty Financial (société crypto de la
+#    famille Trump), lus sur la blockchain (Blockscout) ; son propre jeton WLFI et les jetons sans marché sont exclus,
+#    les stablecoins comptent comme liquidités. Cours de Hyperliquid.
+TRUMP_SUIVI = "https://tracefour.com/v1/trackers/trump-portfolio"
+WLFI_ADRESSE = "0x5be9a4959308a0d0c7bc0870e319314d8d957dbb"      # « World Liberty: Multisig » (Etherscan)
+WLFI_SOLDES = f"https://eth.blockscout.com/api/v2/addresses/{WLFI_ADRESSE}/token-balances"
+WLFI_EXCLUS = {"WLFI"}
+STABLES = {"USD1", "USDC", "USDT", "DAI", "USDN", "PYUSD", "FDUSD", "USDE", "USDS", "TUSD"}
+ALIAS_HL = {"WBTC": "BTC", "CBBTC": "BTC", "TBTC": "BTC", "WETH": "ETH", "STETH": "ETH"}
+
+
+def trump_suivi():
+    if SIMU:
+        return _simu("trump.json")
+    return json.loads(_http(TRUMP_SUIVI, timeout=40))
+
+
+def wlfi_soldes():
+    """Soldes du multisig de World Liberty : {symbole: quantité} (jetons ERC-20 et ETH)."""
+    if SIMU:
+        return _simu("wlfi.json")
+    out = {}
+    for it in json.loads(_http(WLFI_SOLDES, timeout=40)):
+        tok = it.get("token") or {}
+        sym, dec = (tok.get("symbol") or "").upper(), int(tok.get("decimals") or 0)
+        q = nombre(it.get("value"))
+        if sym and q:
+            out[sym] = out.get(sym, 0.0) + q / 10 ** dec
+    try:
+        a = json.loads(_http(f"https://eth.blockscout.com/api/v2/addresses/{WLFI_ADRESSE}", timeout=40))
+        out["ETH"] = out.get("ETH", 0.0) + (nombre(a.get("coin_balance")) or 0) / 1e18
+    except Exception:
+        pass
+    return out
+
+
+def bot_trump(bot, now, quand, mouvements):
+    if not bot["poches"]:
+        revoir(bot, [{"id": "oge", "nom": "Donald Trump, déclarations OGE 278-T (actions)"},
+                     {"id": "wlfi", "nom": "World Liberty Financial, multisig (crypto)"}], {}, quand, mouvements, "Trump")
+    cours_tout = {}
+    # poche actions : une fois par jour ouvré (et au démarrage)
+    p = bot["poches"]["oge"]
+    if not p["lignes"] or mise_a_jour_du_jour(bot, now):
+        d = trump_suivi().get("data", {})
+        snap = d.get("snapshot") or {}
+        lignes = {symbole_yahoo(h["ticker"]): nombre(h.get("valueUsd")) or 0 for h in snap.get("holdings", [])
+                  if h.get("ticker") and h.get("assetClass") in ("equity", "fund") and not h.get("putCall")}
+        fin = snap.get("periodEnd") or now.strftime("%Y-%m-%d")
+        prix = cours_yahoo(set(lignes) | set(p["lignes"]), (datetime.strptime(fin, "%Y-%m-%d") - timedelta(days=10)).strftime("%Y-%m-%d"))
+        cours = {t: dernier(s) for t, s in prix.items() if s}
+        pos = {}
+        for t, v in lignes.items():                   # nombre de titres à la date du portefeuille déclaré
+            c0 = au_jour(prix.get(t, {}), fin)
+            if c0 and v:
+                pos[t] = v / c0
+        sans_symbole = (nombre(snap.get("totalValueUsd")) or 0) - sum(v for t, v in lignes.items() if t in pos)
+        val = max(sans_symbole, 0.0) + sum(q * cours[t] for t, q in pos.items() if t in cours)
+        p["valeur_compte_suivi"] = round(val, 2)
+        if snap.get("filedAt") != bot.get("depot_oge"):
+            bot["frais_cumules"] += reproduire(p, pos, val, cours, "Actions", quand, mouvements, "Trump")
+            bot["depot_oge"], bot["periode_oge"] = snap.get("filedAt"), fin
+        else:
+            p["dernier_cours"].update({c: x for c, x in cours.items() if c in p["lignes"]})
+        bot["derniere_maj"] = now.strftime("%Y-%m-%d")
+    cours_tout.update(p["dernier_cours"])
+    # poche crypto : à chaque relevé
+    try:
+        mids = {c: float(x) for c, x in hl_info({"type": "allMids"}).items() if not c.startswith("@") and nombre(x)}
+        q = wlfi_soldes()
+        pos, liq = {}, 0.0
+        for sym, n in q.items():
+            if sym in WLFI_EXCLUS:
+                continue
+            if sym in STABLES:
+                liq += n
+                continue
+            coin = ALIAS_HL.get(sym, sym)
+            if coin in mids:                          # seuls les jetons qui ont un marché liquide sont copiés
+                pos[coin] = pos.get(coin, 0.0) + n
+        val = liq + sum(n * mids[c] for c, n in pos.items())
+        w = bot["poches"]["wlfi"]
+        w["valeur_compte_suivi"] = round(val, 2)
+        bot["frais_cumules"] += reproduire(w, pos, val, mids, "Crypto", quand, mouvements, "Trump")
+        cours_tout.update(w["dernier_cours"])
+    except Exception as e:
+        bot["erreurs"].append(f"World Liberty : {type(e).__name__} {str(e)[:80]}")
+        cours_tout.update(bot["poches"]["wlfi"]["dernier_cours"])
+    return cours_tout
+
+
 BOTS = (("Hyperliquid", "Crypto", bot_hyperliquid), ("ARKK", "Actions", bot_arkk),
-        ("Sénateurs", "Actions", bot_senateurs), ("Buffett", "Actions", bot_buffett))
+        ("Sénateurs", "Actions", bot_senateurs), ("Buffett", "Actions", bot_buffett),
+        ("Trump", "Mixte", bot_trump))
 
 
 DEBUT_RETRO = "2026-11-16 12:43"   # UTC : premier trade du journal (T0001, 16/11/2026 13:43 heure de Paris)
-RETRO_VERSION = 4                  # changer ce numéro relance une reconstitution complète (règles modifiées)
+RETRO_VERSION = 5                  # changer ce numéro relance une reconstitution complète (règles modifiées)
 
 
 def main(dossier):

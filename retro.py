@@ -13,6 +13,8 @@ instant T que ce qui était publié à T :
   - Sénateurs : seules les déclarations publiées avant le jour de T ; cours de clôture de la veille ; revue du lundi
     rejouée avec les données disponibles ce jour-là.
   - Buffett : déclaration 13F du 30/09/2026 (publiée le 16/11/2026, jour du début du journal) ; cours de la veille.
+  - Trump : portefeuille boursier tel que déclaré avant T (tracefour) ; multisig World Liberty : soldes actuels moins
+    les transferts de jetons postérieurs à T (Blockscout), cours d'une heure de Hyperliquid.
 Limites : biais du survivant (seuls les comptes encore présents dans le classement actuel peuvent être choisis),
 funding et dividendes négligés, cours à l'heure près pour la crypto et à la clôture de la veille pour les actions.
 """
@@ -34,13 +36,64 @@ def reconstituer(c, debut_txt, maintenant):
     debut = datetime.strptime(debut_txt, "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
     notes, horloge = [], {"T": debut}
     origine = {n: getattr(c, n) for n in ("hl_info", "hl_choisir", "ark_portefeuille", "senat_get", "cours_yahoo",
-                                          "sec_13f", "dataroma_brk")}
+                                          "sec_13f", "dataroma_brk", "trump_suivi", "wlfi_soldes")}
     simu = c.SIMU
 
     def lire(nom, url=None, corps=None, timeout=60):
         if simu:
             return json.load(open(os.path.join(simu, "retro", nom), encoding="utf-8"))
         return json.loads(c._http(url or c.HL_INFO, json.dumps(corps).encode() if corps else None, timeout=timeout))
+
+    # ----- World Liberty (poche crypto du bot Trump) : soldes actuels moins les transferts postérieurs à T -----
+    wl = {"actuel": {}, "transferts": [], "coins": set()}
+    try:
+        wl["actuel"] = origine["wlfi_soldes"]()
+        mids_now = origine["hl_info"]({"type": "allMids"})
+        wl["coins"] = {c.ALIAS_HL.get(s_, s_) for s_ in wl["actuel"] if s_ not in c.STABLES and s_ not in c.WLFI_EXCLUS
+                       and c.ALIAS_HL.get(s_, s_) in mids_now}
+        if simu:
+            wl["transferts"] = lire("wlfi_transferts.json")
+        else:
+            url, params, complet = f"https://eth.blockscout.com/api/v2/addresses/{c.WLFI_ADRESSE}/token-transfers?type=ERC-20", "", False
+            for _ in range(20):
+                r = json.loads(c._http(url + params, timeout=40))
+                for it in r.get("items", []):
+                    t_ = datetime.strptime(it["timestamp"][:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+                    if t_ < debut:
+                        complet = True
+                        break
+                    tok, tot = it.get("token") or {}, it.get("total") or {}
+                    q = (c.nombre(tot.get("value")) or 0) / 10 ** int(tot.get("decimals") or tok.get("decimals") or 0)
+                    sens = 1 if (it.get("to") or {}).get("hash", "").lower() == c.WLFI_ADRESSE else -1
+                    wl["transferts"].append((_ms(t_), (tok.get("symbol") or "").upper(), sens * q))
+                if complet or not r.get("next_page_params"):
+                    complet = True
+                    break
+                params = "&" + "&".join(f"{k}={v}" for k, v in r["next_page_params"].items())
+                time.sleep(0.5)
+            if not complet:
+                notes.append("World Liberty : transferts anciens incomplets, soldes passés approchés")
+    except Exception as e:
+        notes.append(f"World Liberty non reconstitué : {type(e).__name__} {str(e)[:80]}")
+
+    def wlfi_soldes():
+        t = _ms(horloge["T"])
+        q = dict(wl["actuel"])
+        for ti, sym, d in wl["transferts"]:
+            if ti > t:
+                q[sym] = q.get(sym, 0.0) - d
+        return {k: v for k, v in q.items() if v > 1e-12}
+
+    cache_trump = {}
+
+    def trump_suivi():
+        if "d" not in cache_trump:
+            cache_trump["d"] = origine["trump_suivi"]()
+        d = cache_trump["d"]
+        snap = (d.get("data") or {}).get("snapshot") or {}
+        if (snap.get("filedAt") or "9999") < horloge["T"].strftime("%Y-%m-%d"):
+            return d
+        return {"data": {"snapshot": {}}}             # déclaration pas encore publiée à T : poche en liquidités
 
     # ----- Hyperliquid -----
     hl = {"comptes": [], "fills": {}, "valeurs": {}, "actuel": {}, "bougies": {}}
@@ -100,7 +153,7 @@ def reconstituer(c, debut_txt, maintenant):
         if exclus:
             notes.append(f"Hyperliquid : {len(exclus)} comptes écartés (trop de trades pour être reconstitués ou illisibles)")
         notes.append(f"Hyperliquid : {len(cand)} comptes présélectionnés, {len(hl['comptes'])} retenus après les critères de qualité")
-        pieces = set()
+        pieces = set(wl["coins"])
         for a in hl["fills"]:
             pieces |= set(hl["fills"][a]) | set(hl["actuel"][a][0])
         for coin in sorted(pieces):
@@ -126,6 +179,8 @@ def reconstituer(c, debut_txt, maintenant):
         t = _ms(horloge["T"])
         if corps["type"] == "allMids":
             return {coin: str(v) for coin, s in hl["bougies"].items() if (v := dernier_avant(s, t)) is not None}
+        if corps["type"] != "clearinghouseState":
+            raise KeyError(corps["type"])
         a = corps["user"].lower()
         pos = dict(hl["actuel"][a][0])
         for coin, ev in hl["fills"][a].items():
@@ -194,7 +249,8 @@ def reconstituer(c, debut_txt, maintenant):
         return cache_13f["dr"]
 
     remplacants = {"hl_info": hl_info, "hl_choisir": lambda: list(hl["comptes"]), "ark_portefeuille": ark_portefeuille,
-                   "senat_get": senat_get, "cours_yahoo": cours_yahoo, "sec_13f": sec_13f, "dataroma_brk": dataroma_brk}
+                   "senat_get": senat_get, "cours_yahoo": cours_yahoo, "sec_13f": sec_13f, "dataroma_brk": dataroma_brk,
+                   "trump_suivi": trump_suivi, "wlfi_soldes": wlfi_soldes}
     etat, hist, mouvements = {"bots": {}}, [], []
     try:
         for n, f in remplacants.items():
