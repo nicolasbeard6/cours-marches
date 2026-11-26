@@ -39,6 +39,7 @@ import csv
 import io
 import json
 import os
+import re
 import sys
 import time
 import urllib.request
@@ -64,6 +65,7 @@ BRK_CIK = "1067983"
 SEC_SUB = f"https://data.sec.gov/submissions/CIK{int(BRK_CIK):010d}.json"
 SEC_ARCH = f"https://www.sec.gov/Archives/edgar/data/{BRK_CIK}"
 FIGI = "https://api.openfigi.com/v3/mapping"
+DATAROMA = "https://www.dataroma.com/m/holdings.php?m=BRK"
 UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"}
 UA_SEC = {"User-Agent": "cours-marches journal fictif nicolasbeard6@users.noreply.github.com"}   # exigé par la SEC
 SIMU = os.environ.get("COPIE_SIMULATION")
@@ -312,6 +314,20 @@ def sec_13f():
     return lignes, rapport, acc
 
 
+def dataroma_brk():
+    """Secours si la SEC refuse : même 13F, mis en forme par dataroma.com (symboles déjà donnés).
+    Renvoie ({symbole: actions}, date du portefeuille)."""
+    brut = _simu("dataroma.html", texte=True) if SIMU else _http(DATAROMA).decode("utf-8", "replace")
+    date = re.search(r"Portfolio date:\s*([^\n]+)", re.sub(r"<[^>]+>", "", brut))
+    pos = {}
+    for ligne in brut.split("<tr")[1:]:
+        sym = re.search(r'class="stock"><a href="/m/stock\.php\?sym=([^"&]+)"', ligne)
+        cases = [re.sub(r"<[^>]+>", "", c).strip() for c in re.findall(r"<td[^>]*>(.*?)</td>", ligne, re.S)]
+        if sym and len(cases) > 4 and nombre(cases[4]):
+            pos[symbole_yahoo(sym.group(1))] = nombre(cases[4])
+    return pos, (date.group(1).strip() if date else None)
+
+
 def figi(cusips, cache):
     """CUSIP -> symbole Yahoo (OpenFIGI, sans clé : 10 CUSIP par requête, 25 requêtes par minute)."""
     manque = [c for c in cusips if c not in cache]
@@ -498,14 +514,22 @@ def bot_senateurs(bot, now, quand, mouvements):
 def bot_buffett(bot, now, quand, mouvements):
     if bot["poches"] and not mise_a_jour_du_jour(bot, now):
         return dict(bot["poches"]["BRK"]["dernier_cours"])
-    lignes, rapport, acc = sec_13f()
-    cache = figi(list(lignes), bot.setdefault("cusip_vers_symbole", {}))
-    pos = {}
-    for cu, (nom, q) in lignes.items():
-        if cu in cache:
-            pos[cache[cu]] = pos.get(cache[cu], 0) + q
-        else:
-            bot["erreurs"].append(f"CUSIP {cu} ({nom}) sans symbole : ligne ignorée")
+    try:
+        lignes, rapport, acc = sec_13f()
+        cache = figi(list(lignes), bot.setdefault("cusip_vers_symbole", {}))
+        pos = {}
+        for cu, (nom, q) in lignes.items():
+            if cu in cache:
+                pos[cache[cu]] = pos.get(cache[cu], 0) + q
+            else:
+                bot["erreurs"].append(f"CUSIP {cu} ({nom}) sans symbole : ligne ignorée")
+        bot["source_13f"] = "SEC"
+    except Exception as e:                            # la SEC refuse parfois les machines de GitHub : secours dataroma
+        pos, rapport = dataroma_brk()
+        acc = f"dataroma {rapport}"
+        bot["source_13f"] = f"dataroma (SEC : {type(e).__name__})"
+        if not pos:
+            raise
     prix = cours_yahoo(set(pos) | {c for p in bot["poches"].values() for c in p["lignes"]})
     cours = {t: dernier(s) for t, s in prix.items() if s}
     if not bot["poches"]:
@@ -526,6 +550,9 @@ BOTS = (("Hyperliquid", "Crypto", bot_hyperliquid), ("ARKK", "Actions", bot_arkk
         ("Sénateurs", "Actions", bot_senateurs), ("Buffett", "Actions", bot_buffett))
 
 
+DEBUT_RETRO = "2026-11-16 12:43"   # UTC : premier trade du journal (T0001, 16/11/2026 13:43 heure de Paris)
+
+
 def main(dossier):
     rep = os.path.join(dossier, "copie")
     os.makedirs(rep, exist_ok=True)
@@ -534,6 +561,27 @@ def main(dossier):
     etat, hist, mouvements = lire("etat", {"bots": {}}), lire("historique", []), lire("mouvements", [])
     now = (datetime.strptime(os.environ["COPIE_MAINTENANT"], "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
            if os.environ.get("COPIE_MAINTENANT") else datetime.now(timezone.utc))
+    essais = etat.get("retro_essais", 0)
+    if etat.get("retro", {}).get("debut") != DEBUT_RETRO and essais < 3 and not os.environ.get("COPIE_SANS_RETRO"):
+        # Une seule fois : les bots sont reconstitués depuis le début du journal, avec les mêmes règles et les seules
+        # données publiées à chaque instant, puis le relevé continue normalement (voir retro.py). Trois essais au plus.
+        try:
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            import retro
+            etat, hist, mouvements = retro.reconstituer(sys.modules[__name__], DEBUT_RETRO, now)
+        except Exception as e:
+            print("reconstitution en échec :", type(e).__name__, str(e)[:200])
+            etat["retro_essais"] = essais + 1
+            etat["retro_erreur"] = f"{type(e).__name__}: {str(e)[:200]}"
+    etat, hist, mouvements = un_passage(etat, hist, mouvements, now)
+    json.dump(etat, open(chemins["etat"], "w", encoding="utf-8"), ensure_ascii=False, separators=(",", ":"))
+    json.dump(hist[-5000:], open(chemins["historique"], "w", encoding="utf-8"), ensure_ascii=False, separators=(",", ":"))
+    json.dump(mouvements[-20000:], open(chemins["mouvements"], "w", encoding="utf-8"), ensure_ascii=False, separators=(",", ":"))
+    print("bots de copie :", json.dumps({n: {k: s[k] for k in ("valeur", "resultat", "exposition")} | {"erreurs": len(s["erreurs"])}
+                                          for n, s in etat["synthese"].items()}, ensure_ascii=False))
+
+
+def un_passage(etat, hist, mouvements, now):
     quand, jour = now.strftime("%Y-%m-%d %H:%M"), now.strftime("%Y-%m-%d")
     for nom, classe, fn in BOTS:
         bot = etat["bots"].setdefault(nom, nouveau_bot(classe))
@@ -555,11 +603,7 @@ def main(dossier):
     for n, s in etat["synthese"].items():             # une ligne par bot et par jour (la dernière du jour est gardée)
         hist = [h for h in hist if not (h["date"] == jour and h["bot"] == n)]
         hist.append({"date": jour, "bot": n, **{k: s[k] for k in ("classe", "valeur", "resultat", "achats", "ventes", "exposition")}})
-    json.dump(etat, open(chemins["etat"], "w", encoding="utf-8"), ensure_ascii=False, separators=(",", ":"))
-    json.dump(hist[-5000:], open(chemins["historique"], "w", encoding="utf-8"), ensure_ascii=False, separators=(",", ":"))
-    json.dump(mouvements[-20000:], open(chemins["mouvements"], "w", encoding="utf-8"), ensure_ascii=False, separators=(",", ":"))
-    print("bots de copie :", json.dumps({n: {k: s[k] for k in ("valeur", "resultat", "exposition")} | {"erreurs": len(s["erreurs"])}
-                                          for n, s in etat["synthese"].items()}, ensure_ascii=False))
+    return etat, hist, mouvements
 
 
 if __name__ == "__main__":

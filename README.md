@@ -17,6 +17,8 @@ Ce dépôt ne contient que des données de marché publiques et la liste des ins
   5 sénateurs américains dont les achats déclarés ont le mieux rapporté sur 12 mois (données tracefour.com, CC BY 4.0) ;
   « Buffett » les lignes de Berkshire Hathaway déclarées chaque trimestre à la SEC (13F). Ils achètent et vendent quand
   les comptes suivis le font ; la dérive des cours seule ne déclenche aucun ordre.
+- `retro.py` : reconstitue une fois les bots de copie depuis le début du journal (16/11/2026), avec les mêmes règles et
+  les seules données publiées à chaque instant ; le relevé continue ensuite normalement.
 
 Résultat : branche `data`, fichiers `resume.json`, `barres/<symbole>.json`, `tendance/etat.json`, `tendance/historique.json`
 et `copie/etat.json`, `copie/historique.json`, `copie/mouvements.json`.
