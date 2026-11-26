@@ -38,14 +38,16 @@ def sens_tendance(i):
     return signe(sum(votes))
 
 
-def main(dossier):
-    resume = json.load(open(os.path.join(dossier, "resume.json"), encoding="utf-8"))
+def main(dossier, now=None, resume=None):
+    """now et resume ne servent qu'à la reconstitution (retro_tendance.py) : par défaut, l'heure actuelle et DOSSIER/resume.json."""
+    if resume is None:
+        resume = json.load(open(os.path.join(dossier, "resume.json"), encoding="utf-8"))
     rep = os.path.join(dossier, "tendance")
     os.makedirs(rep, exist_ok=True)
     p_etat, p_hist = os.path.join(rep, "etat.json"), os.path.join(rep, "historique.json")
     etat = json.load(open(p_etat, encoding="utf-8")) if os.path.exists(p_etat) else {"debut": None, "bots": {}}
     hist = json.load(open(p_hist, encoding="utf-8")) if os.path.exists(p_hist) else []
-    now = datetime.now(timezone.utc)
+    now = now or datetime.now(timezone.utc)
     jour = now.strftime("%Y-%m-%d")
     par_classe = {}
     for i in resume["instruments"]:
