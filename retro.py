@@ -4,8 +4,8 @@ Les bots sont rejoués heure par heure depuis DEBUT_RETRO, avec exactement les r
 instant T que ce qui était publié à T :
   - Hyperliquid : position de chaque compte à T reconstituée à partir de ses trades (userFillsByTime : position avant
     chaque trade + quantité échangée), valeur du compte à T (portfolio), cours à T (bougies d'une heure).
-    Choix des comptes au départ : même filtre que copie.py (valeur ≥ VALEUR_MIN, gagnant depuis le début, actif), mais
-    classés par gain AVANT le dernier mois (gain total − gain du mois), pour ne pas choisir sur la période rejouée.
+    Choix des comptes au départ : mêmes critères de qualité que copie.py (ancienneté, pire baisse, rotation), mais avec
+    le gain AVANT le dernier mois et un historique coupé au début, pour ne pas choisir sur la période rejouée.
     Les comptes dont les trades de la période ne sont pas tous disponibles (plus de 10 000 trades : teneurs de marché)
     sont écartés, faute de pouvoir les reconstituer. Pas de revue le lundi pendant la reconstitution (le classement
     passé n'est pas publié) : la première revue réelle a lieu au premier lundi suivant.
@@ -23,7 +23,6 @@ from datetime import datetime, timedelta, timezone
 
 ARK_HIST = "https://arkfunds.io/api/v2/etf/holdings?symbol=ARKK&date_from={de}&date_to={a}"
 MAX_TRADES = 9500
-MAX_CANDIDATS = 40
 
 
 def _ms(dt):
@@ -46,25 +45,12 @@ def reconstituer(c, debut_txt, maintenant):
     # ----- Hyperliquid -----
     hl = {"comptes": [], "fills": {}, "valeurs": {}, "actuel": {}, "bougies": {}}
     try:
-        lignes = c._simu("leaderboard.json") if simu else json.loads(c._http(c.HL_CLASSEMENT, timeout=120))
-        lignes = lignes.get("leaderboardRows", lignes) if isinstance(lignes, dict) else lignes
-        cand = []
-        for r in lignes:
-            try:
-                v, p = float(r["accountValue"]), c.fenetres(r["windowPerformances"])
-                avant = float(p["allTime"]["pnl"]) - float(p["month"]["pnl"])
-                actif = float(p["month"]["vlm"]) > 0
-            except (KeyError, TypeError, ValueError):
-                continue
-            if v >= c.VALEUR_MIN and avant > 0 and float(p["allTime"]["pnl"]) > 0 and actif:
-                cand.append({"id": r["ethAddress"].lower(), "nom": r.get("displayName") or "", "valeur": round(v, 2),
-                             "gain_avant_le_mois": round(avant, 2)})
-        cand.sort(key=lambda x: -x["gain_avant_le_mois"])
-        exclus = []
-        for k in cand[:MAX_CANDIDATS]:
-            if len(hl["comptes"]) >= c.N_COMPTES:
-                break
-            a = k["id"]
+        # même sélection que copie.py (qualité des comptes), mais avec le gain d'AVANT le dernier mois et un historique
+        # coupé au début de la reconstitution ; le levier du moment n'est pas connu, il n'est donc pas filtré ici
+        cand = c.hl_preselection(c.hl_classement(), lambda p: float(p["allTime"]["pnl"]) - float(p["month"]["pnl"]))
+        exclus, lus = [], {}
+
+        def accepter(a):
             try:
                 fills, depart = {}, _ms(debut)
                 for _ in range(6):
@@ -78,8 +64,8 @@ def reconstituer(c, debut_txt, maintenant):
                     time.sleep(1)
                 if len(fills) >= MAX_TRADES:
                     exclus.append(a)
-                    continue
-                port = lire(f"portfolio/{a}.json") if simu else lire(None, corps={"type": "portfolio", "user": a})
+                    return False
+                port = c.hl_info({"type": "portfolio", "user": a})
                 port = {n: d for n, d in port} if isinstance(port, list) else port
                 hist_v = (port.get("perpMonth") or port.get("month") or {}).get("accountValueHistory", [])
                 etat_a = c.hl_info({"type": "clearinghouseState", "user": a})
@@ -87,7 +73,13 @@ def reconstituer(c, debut_txt, maintenant):
             except Exception as e:
                 exclus.append(a)
                 notes.append(f"Hyperliquid {a[:10]} illisible : {str(e)[:60]}")
-                continue
+                return False
+            lus[a] = (fills, hist_v, etat_a)
+            return True
+
+        for k in c.hl_retenir(cand, _ms(debut), False, accepter):
+            a = k["id"]
+            fills, hist_v, etat_a = lus[a]
             par_coin = {}
             for f in sorted(fills.values(), key=lambda f: f["time"]):
                 if "@" in f["coin"] or ":" in f["coin"]:      # spot et marchés HIP-3 : hors du compte suivi par copie.py
@@ -105,6 +97,7 @@ def reconstituer(c, debut_txt, maintenant):
             hl["comptes"].append(k)
         if exclus:
             notes.append(f"Hyperliquid : {len(exclus)} comptes écartés (trop de trades pour être reconstitués ou illisibles)")
+        notes.append(f"Hyperliquid : {len(cand)} comptes présélectionnés, {len(hl['comptes'])} retenus après les critères de qualité")
         pieces = set()
         for a in hl["fills"]:
             pieces |= set(hl["fills"][a]) | set(hl["actuel"][a][0])
@@ -177,7 +170,7 @@ def reconstituer(c, debut_txt, maintenant):
     def cours_yahoo(tickers, debut_=None):
         manque = sorted({t for t in tickers if t and t not in cache_prix})
         if manque:
-            cache_prix.update(origine["cours_yahoo"](manque, (debut - timedelta(days=800)).strftime("%Y-%m-%d")))
+            cache_prix.update(origine["cours_yahoo"](manque, c.DEBUT_COURS_CONGRES))
             for t in manque:
                 cache_prix.setdefault(t, {})
         veille = horloge["T"].strftime("%Y-%m-%d")
@@ -212,7 +205,7 @@ def reconstituer(c, debut_txt, maintenant):
     finally:
         for n, f in origine.items():
             setattr(c, n, f)
-    etat["retro"] = {"debut": debut_txt, "fait_utc": maintenant.strftime("%Y-%m-%d %H:%M"), "notes": notes,
+    etat["retro"] = {"debut": debut_txt, "version": c.RETRO_VERSION, "fait_utc": maintenant.strftime("%Y-%m-%d %H:%M"), "notes": notes,
                      "hyperliquid_comptes": hl["comptes"]}
     for b in etat["bots"].values():                     # les erreurs de la reconstitution restent dans les notes
         if b.get("erreurs"):

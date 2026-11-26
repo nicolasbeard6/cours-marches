@@ -52,9 +52,19 @@ N_COMPTES = 10
 VALEUR_MIN = 100000.0
 N_SENATEURS = 5
 MIN_ACHATS = 5
+TOUJOURS_SUIVIS = ["nancy-pelosi"]        # suivie en plus des sénateurs choisis (demande de l'utilisateur, 26/11/2026)
+DEBUT_COURS_CONGRES = "2015-01-01"        # cours chargés depuis cette date pour reconstituer les portefeuilles déclarés
 SEUIL_RELATIF = 0.10
 SEUIL_ABS = 10.0
 HEURE_UTC = 15
+# Qualité des comptes Hyperliquid (v2, 26/11/2026, d'après les conseils publiés sur le copy trading) :
+HL_ANCIENNETE_MIN = 90       # jours d'historique au moins (sinon chance ou contexte favorable)
+HL_BAISSE_MAX = 0.40         # pire baisse de l'équité ≤ 40 %
+HL_LEVIER_MAX = 10.0         # exposition brute ≤ 10 fois la valeur du compte au moment du choix
+HL_ROTATION_MAX = 200.0      # volume du mois ≤ 200 fois la valeur du compte (écarte les teneurs de marché)
+HL_PRESELECTION = 40         # comptes examinés en détail à chaque revue
+HL_PART_MAX_ACTIF = 0.30     # un actif ≤ 30 % de la valeur du bot (somme des comptes copiés)
+HL_PART_MAX_SENS = 0.60      # exposition nette dans un sens ≤ 60 % de la valeur du bot
 
 HL_INFO = "https://api.hyperliquid.xyz/info"
 HL_CLASSEMENT = "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard"
@@ -138,10 +148,11 @@ def dernier(serie):
 
 
 def au_jour(serie, jour):
-    """Clôture du jour donné, ou du premier jour de bourse suivant."""
+    """Clôture du jour donné, ou du premier jour de bourse suivant (dans les 10 jours ; sinon inconnue)."""
+    limite = (datetime.strptime(jour[:10], "%Y-%m-%d") + timedelta(days=10)).strftime("%Y-%m-%d")
     for d in sorted(serie):
         if d >= jour:
-            return serie[d]
+            return serie[d] if d <= limite else None
     return None
 
 
@@ -149,7 +160,11 @@ def au_jour(serie, jour):
 
 def hl_info(corps):
     if SIMU:
-        return _simu("mids.json") if corps["type"] == "allMids" else _simu("etats", corps["user"].lower() + ".json")
+        if corps["type"] == "allMids":
+            return _simu("mids.json")
+        if corps["type"] == "portfolio":
+            return _simu("portfolios", corps["user"].lower() + ".json")
+        return _simu("etats", corps["user"].lower() + ".json")
     return json.loads(_http(HL_INFO, json.dumps(corps).encode()))
 
 
@@ -157,21 +172,82 @@ def fenetres(wp):
     return wp if isinstance(wp, dict) else {n: p for n, p in wp}
 
 
-def hl_choisir():
+def hl_classement():
     lignes = _simu("leaderboard.json") if SIMU else json.loads(_http(HL_CLASSEMENT, timeout=120))
-    lignes = lignes.get("leaderboardRows", lignes) if isinstance(lignes, dict) else lignes
-    retenus = []
+    return lignes.get("leaderboardRows", lignes) if isinstance(lignes, dict) else lignes
+
+
+def hl_evaluer(adresse, jusqua_ms=None, avec_levier=True):
+    """Qualité d'un compte d'après son historique public (portfolio, fenêtre allTime), coupé à jusqua_ms :
+    ancienneté (jours), pire baisse de l'équité, rendement total, levier actuel. None si l'historique manque."""
+    port = hl_info({"type": "portfolio", "user": adresse})
+    port = {n: d for n, d in port} if isinstance(port, list) else port
+    w = port.get("perpAllTime") or port.get("allTime") or {}
+    av = [(int(t), float(v)) for t, v in w.get("accountValueHistory", []) if jusqua_ms is None or int(t) <= jusqua_ms]
+    pnl = [(int(t), float(v)) for t, v in w.get("pnlHistory", []) if jusqua_ms is None or int(t) <= jusqua_ms]
+    if len(av) < 2 or len(pnl) < 2:
+        return None
+    base = av[-1][1] - pnl[-1][1]                    # dépôts nets approchés : équité = base + gain cumulé
+    pic, baisse = None, 0.0
+    for _, g in pnl:
+        eq = base + g
+        if pic is None or eq > pic:
+            pic = eq
+        if pic and pic > 0:
+            baisse = max(baisse, (pic - eq) / pic)
+    rend = pnl[-1][1] / base if base > 0 else pnl[-1][1] / max(av[-1][1], 1.0)
+    levier = None
+    if avec_levier:
+        e = hl_info({"type": "clearinghouseState", "user": adresse})
+        m = e.get("marginSummary", {})
+        levier = (nombre(m.get("totalNtlPos")) or 0.0) / max(nombre(m.get("accountValue")) or 1.0, 1.0)
+    return {"anciennete_j": round((av[-1][0] - av[0][0]) / 86400000, 1), "pire_baisse": round(baisse, 4),
+            "rendement": round(rend, 4), "levier": None if levier is None else round(levier, 2),
+            "score": round(rend / max(baisse, 0.05), 4)}
+
+
+def hl_preselection(lignes, gain_cle):
+    """Filtre du classement : valeur ≥ VALEUR_MIN, gagnant depuis le début et sur la période gain_cle(p) > 0,
+    actif sur le mois sans être un teneur de marché (rotation ≤ HL_ROTATION_MAX). Classés par rendement total."""
+    cand = []
     for r in lignes:
         try:
             v, p = float(r["accountValue"]), fenetres(r["windowPerformances"])
-            mois, tout, sem = float(p["month"]["pnl"]), float(p["allTime"]["pnl"]), float(p["week"]["vlm"])
+            tout, g, vlm = float(p["allTime"]["pnl"]), gain_cle(p), float(p["month"]["vlm"])
+            roi = float(p["allTime"].get("roi") or 0)
         except (KeyError, TypeError, ValueError):
             continue
-        if v >= VALEUR_MIN and mois > 0 and tout > 0 and sem > 0:
-            retenus.append({"id": r["ethAddress"].lower(), "nom": r.get("displayName") or "", "valeur": round(v, 2),
-                            "gain_mois": round(mois, 2)})
-    retenus.sort(key=lambda x: -x["gain_mois"])
-    return retenus[:N_COMPTES]
+        if v >= VALEUR_MIN and tout > 0 and g > 0 and 0 < vlm <= HL_ROTATION_MAX * v:
+            cand.append({"id": r["ethAddress"].lower(), "nom": r.get("displayName") or "", "valeur": round(v, 2),
+                         "gain_periode": round(g, 2), "roi_total": roi})
+    cand.sort(key=lambda x: -x["roi_total"])
+    return cand
+
+
+def hl_retenir(cand, jusqua_ms=None, avec_levier=True, accepter=lambda a: True):
+    """Examine les candidats dans l'ordre : ancienneté, pire baisse et levier ; classe les admis par
+    rendement ÷ pire baisse (au moins 5 %) et garde les N_COMPTES meilleurs."""
+    admis = []
+    for k in cand[:HL_PRESELECTION]:
+        try:
+            q = hl_evaluer(k["id"], jusqua_ms, avec_levier)
+            time.sleep(0 if SIMU else 0.5)
+        except Exception:
+            continue
+        if not q or q["anciennete_j"] < HL_ANCIENNETE_MIN or q["pire_baisse"] > HL_BAISSE_MAX:
+            continue
+        if q["levier"] is not None and q["levier"] > HL_LEVIER_MAX:
+            continue
+        if not accepter(k["id"]):
+            continue
+        admis.append(dict(k, **q))
+    admis.sort(key=lambda x: -x["score"])
+    return admis[:N_COMPTES]
+
+
+def hl_choisir():
+    cand = hl_preselection(hl_classement(), lambda p: float(p["month"]["pnl"]))
+    return hl_retenir(cand)
 
 
 def hl_portefeuille(adresse):
@@ -229,8 +305,9 @@ def senat_trades(slug):
         tk, typ = (t.get("ticker") or "").strip(), (t.get("type") or "")
         detail = (t.get("filingId") or "").split("|")
         detail = detail[3] if len(detail) > 3 else typ
-        if not tk or tk in ("--", "N/A") or (t.get("assetType") or "") not in ("Stock", "ETF"):
-            continue
+        typ_actif = t.get("assetType") or ""
+        if not tk or tk in ("--", "N/A") or not (typ_actif in ("Stock", "ETF") or "Option" in typ_actif):
+            continue                                  # une option est copiée comme l'action sous-jacente, pour le même montant
         m = nombre(t.get("amountMid")) or 0
         if detail.startswith("Purchase"):
             out.append((t["transactionDate"], symbole_yahoo(tk), 1, m))
@@ -262,17 +339,17 @@ def senat_portefeuille(trades, prix):
 
 
 def senat_choisir(now):
-    membres = [m for m in senat_get().get("data", []) if m.get("chamber") == "senate"]
+    membres = [m for m in senat_get().get("data", []) if m.get("chamber") == "senate" or m.get("slug") in TOUJOURS_SUIVIS]
     tous, erreurs = {}, []
     for m in membres:
         try:
             tous[m["slug"]] = (m.get("name") or m["slug"], senat_trades(m["slug"]))
         except Exception as e:                        # limite de requêtes ou page absente : sénateur ignoré cette fois
             erreurs.append(m["slug"])
-    debut = (now - timedelta(days=760)).strftime("%Y-%m-%d")
+    debut = DEBUT_COURS_CONGRES
     prix = cours_yahoo({tk for _, tr in tous.values() for _, tk, _, _ in tr}, debut)
     il_y_a_un_an = (now - timedelta(days=365)).strftime("%Y-%m-%d")
-    scores = []
+    scores, imposes = [], []
     for slug, (nom, tr) in tous.items():
         somme, pond, n = 0.0, 0.0, 0
         for jour, tk, s, m in tr:
@@ -281,10 +358,14 @@ def senat_choisir(now):
             c0, c1 = au_jour(prix.get(tk, {}), jour), dernier(prix.get(tk, {}))
             if c0 and c1:
                 somme, pond, n = somme + m * (c1 / c0 - 1), pond + m, n + 1
-        if n >= MIN_ACHATS and pond and somme > 0 and senat_portefeuille(tr, prix)[0]:
-            scores.append({"id": slug, "nom": nom, "achats_12m": n, "rendement_achats_12m": round(somme / pond, 4)})
+        ligne = {"id": slug, "nom": nom, "achats_12m": n, "rendement_achats_12m": round(somme / pond, 4) if pond else None}
+        if slug in TOUJOURS_SUIVIS:
+            if senat_portefeuille(tr, prix)[0]:
+                imposes.append(dict(ligne, impose=True))
+        elif n >= MIN_ACHATS and pond and somme > 0 and senat_portefeuille(tr, prix)[0]:
+            scores.append(ligne)
     scores.sort(key=lambda x: -x["rendement_achats_12m"])
-    return scores[:N_SENATEURS], {s: tr for s, (_, tr) in tous.items()}, prix, erreurs
+    return imposes + scores[:N_SENATEURS], {s: tr for s, (_, tr) in tous.items()}, prix, erreurs
 
 
 # Berkshire (13F)
@@ -355,8 +436,10 @@ def valeur_poche(p, cours):
     return p["liquidites"] + sum(q * cours.get(c, p["dernier_cours"].get(c, 0)) for c, q in p["lignes"].items())
 
 
-def reproduire(p, cible_src, valeur_src, cours, classe, quand, mouvements, bot):
-    """Aligne une poche sur le portefeuille d'un compte suivi. Renvoie les frais payés."""
+def reproduire(p, cible_src, valeur_src, cours, classe, quand, mouvements, bot, echelle=None):
+    """Aligne une poche sur le portefeuille d'un compte suivi (echelle : réduction par ligne, plafonds du bot).
+    Renvoie les frais payés."""
+    echelle = echelle or {}
     for c, x in cours.items():
         if c in p["lignes"] or c in cible_src:
             p["dernier_cours"][c] = x
@@ -369,7 +452,7 @@ def reproduire(p, cible_src, valeur_src, cours, classe, quand, mouvements, bot):
         if not x:                                     # pas de cours pour une ligne à ouvrir : laissée de côté
             continue                                  # (une ligne sortie du portefeuille suivi se revend au dernier cours connu)
         avant = p["lignes"].get(c, 0.0)
-        apres = cible_src.get(c, 0.0) * f
+        apres = cible_src.get(c, 0.0) * f * echelle.get(c, 1.0)
         ecart = (apres - avant) * x
         change_sens = avant and apres and (avant > 0) != (apres > 0)
         if not ((avant and not apres) or (apres and not avant) or change_sens):
@@ -449,15 +532,45 @@ def bot_hyperliquid(bot, now, quand, mouvements):
             bot["derniere_revue"] = now.strftime("%Y-%m-%d")
         elif not bot["poches"]:
             bot["erreurs"].append("classement Hyperliquid vide ou illisible")
+    lus = {}
     for a, p in bot["poches"].items():
         try:
-            pos, val = hl_portefeuille(a)
+            lus[a] = hl_portefeuille(a)
         except Exception as e:
             bot["erreurs"].append(f"{a}: {str(e)[:80]}")
-            continue
+    echelle = plafonds_hl(bot, lus, cours)
+    for a, (pos, val) in lus.items():
+        p = bot["poches"][a]
         p["valeur_compte_suivi"] = round(val, 2)
-        bot["frais_cumules"] += reproduire(p, pos, val, cours, "Crypto", quand, mouvements, "Hyperliquid")
+        bot["frais_cumules"] += reproduire(p, pos, val, cours, "Crypto", quand, mouvements, "Hyperliquid", echelle)
     return cours
+
+
+def plafonds_hl(bot, lus, cours):
+    """Réductions par actif pour qu'au niveau du bot un actif pèse au plus HL_PART_MAX_ACTIF de sa valeur et
+    l'exposition nette dans un sens au plus HL_PART_MAX_SENS (les positions suivies sont additionnées)."""
+    vb = sum(valeur_poche(p, cours) for p in bot["poches"].values())
+    expo = {}
+    for a, (pos, val) in lus.items():
+        p = bot["poches"][a]
+        v = valeur_poche(p, cours)
+        brut = sum(abs(q) * cours[c] for c, q in pos.items() if c in cours)
+        f = v / max(val, brut) if v > 0 and max(val, brut) > 0 else 0.0
+        for c, q in pos.items():
+            if c in cours:
+                expo[c] = expo.get(c, 0.0) + q * f * cours[c]
+    if vb <= 0:
+        return {}
+    ech = {c: min(1.0, HL_PART_MAX_ACTIF * vb / abs(e)) for c, e in expo.items() if e}
+    long_ = sum(e * ech[c] for c, e in expo.items() if e > 0)
+    court = -sum(e * ech[c] for c, e in expo.items() if e < 0)
+    if long_ - court > HL_PART_MAX_SENS * vb:
+        k = (HL_PART_MAX_SENS * vb + court) / long_
+        ech = {c: x * (k if expo[c] > 0 else 1.0) for c, x in ech.items()}
+    elif court - long_ > HL_PART_MAX_SENS * vb:
+        k = (HL_PART_MAX_SENS * vb + long_) / court
+        ech = {c: x * (k if expo[c] < 0 else 1.0) for c, x in ech.items()}
+    return {c: x for c, x in ech.items() if x < 0.999}
 
 
 def bot_arkk(bot, now, quand, mouvements):
@@ -478,7 +591,7 @@ def bot_arkk(bot, now, quand, mouvements):
 def bot_senateurs(bot, now, quand, mouvements):
     if not (jour_de_revue(bot, now) or mise_a_jour_du_jour(bot, now)):
         return {c: x for p in bot["poches"].values() for c, x in p["dernier_cours"].items()}
-    debut = (now - timedelta(days=760)).strftime("%Y-%m-%d")
+    debut = DEBUT_COURS_CONGRES
     if jour_de_revue(bot, now):
         choisis, trades, prix, erreurs = senat_choisir(now)
         if erreurs:
@@ -551,6 +664,7 @@ BOTS = (("Hyperliquid", "Crypto", bot_hyperliquid), ("ARKK", "Actions", bot_arkk
 
 
 DEBUT_RETRO = "2026-11-16 12:43"   # UTC : premier trade du journal (T0001, 16/11/2026 13:43 heure de Paris)
+RETRO_VERSION = 2                  # changer ce numéro relance une reconstitution complète (règles modifiées)
 
 
 def main(dossier):
@@ -561,8 +675,11 @@ def main(dossier):
     etat, hist, mouvements = lire("etat", {"bots": {}}), lire("historique", []), lire("mouvements", [])
     now = (datetime.strptime(os.environ["COPIE_MAINTENANT"], "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
            if os.environ.get("COPIE_MAINTENANT") else datetime.now(timezone.utc))
-    essais = etat.get("retro_essais", 0)
-    if etat.get("retro", {}).get("debut") != DEBUT_RETRO and essais < 3 and not os.environ.get("COPIE_SANS_RETRO"):
+    cle = f"retro_essais_v{RETRO_VERSION}"
+    essais = etat.get(cle, 0)
+    fait = etat.get("retro", {})
+    if (fait.get("debut"), fait.get("version", 1)) != (DEBUT_RETRO, RETRO_VERSION) and essais < 3 \
+            and not os.environ.get("COPIE_SANS_RETRO"):
         # Une seule fois : les bots sont reconstitués depuis le début du journal, avec les mêmes règles et les seules
         # données publiées à chaque instant, puis le relevé continue normalement (voir retro.py). Trois essais au plus.
         try:
@@ -571,7 +688,7 @@ def main(dossier):
             etat, hist, mouvements = retro.reconstituer(sys.modules[__name__], DEBUT_RETRO, now)
         except Exception as e:
             print("reconstitution en échec :", type(e).__name__, str(e)[:200])
-            etat["retro_essais"] = essais + 1
+            etat[cle] = essais + 1
             etat["retro_erreur"] = f"{type(e).__name__}: {str(e)[:200]}"
     etat, hist, mouvements = un_passage(etat, hist, mouvements, now)
     json.dump(etat, open(chemins["etat"], "w", encoding="utf-8"), ensure_ascii=False, separators=(",", ":"))
