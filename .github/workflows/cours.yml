@@ -30,6 +30,10 @@ jobs:
           for f in etat.json historique.json; do
             git show "origin/data:tendance/$f" > "out/tendance/$f" 2>/dev/null || rm -f "out/tendance/$f"   # absent au premier passage
           done
+      - name: Reconstitution du bot de tendance depuis le 16/11 (une seule fois)
+        continue-on-error: true
+        timeout-minutes: 15
+        run: python retro_tendance.py out
       - name: Bot de tendance automatique (référence du journal)
         continue-on-error: true                  # une erreur ici ne bloque pas la publication des cours ; l'état précédent est gardé
         run: python tendance.py out
